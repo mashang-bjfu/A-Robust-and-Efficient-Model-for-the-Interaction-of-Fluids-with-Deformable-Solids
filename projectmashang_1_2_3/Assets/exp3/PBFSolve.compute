@@ -1,0 +1,349 @@
+// Each #kernel tells which function to compile; you can have many kernels
+
+// 能写中文注释吗？——装了个插件，能了
+
+#pragma kernel SetParticleDatasForRender
+
+
+#pragma kernel PreTreatment
+#pragma kernel ComputeLambdas
+#pragma kernel ComputeDeltaPositions
+#pragma kernel UpdatePositions
+#pragma kernel PostTreatment
+
+#pragma kernel NeighbourSearchReset
+#pragma kernel NeighbourSearchInit
+#pragma kernel ComputeNeighbourList
+
+#pragma kernel EmitterGPU
+
+//define constant value
+
+// the space of simulation is from boundary[0] to boundary[1],such as from [0,0,0] to [40,60,70]
+// set type as float4 is make data align to float4 as HLSL packed
+float4 _boundary[2]; 
+
+float _gridSize; // if value == 2.51,then volume of a grid is 2.51**3
+float _gridRecpr;
+int3 _gridScale;//if boundary[0]=[0,0,0],boundary[1]=[251.2,251.2,251.2]; so gridScale=[101,101,101]
+int _maxParticleNumPerCell;
+int _maxNeighborNumPerParticle;
+
+uint _particleNums;
+
+uint _activeParticleNums;
+
+float _deltaTime;
+
+float _particleRadius;// radius in world space .set for collision detection and render.
+
+float _supportRadius;// set for SPH kernel
+float _mass;
+float _rho0; // 正常来讲，应该是1000
+
+float _epsilonOfLambda;
+
+float _poly6Factor;
+float _spikyGradFactor;
+
+float3 G;
+
+RWStructuredBuffer<float3> _positions;
+RWStructuredBuffer<float3> _oldPositions;
+RWStructuredBuffer<float3> _velocities;
+
+RWStructuredBuffer<float> _lambdas;
+RWStructuredBuffer<float3> _deltaPositions;
+
+//neighbour search 
+RWStructuredBuffer<uint> _particleNumPerGrid;
+RWStructuredBuffer<uint> _particleIndexsPerGrid;
+RWStructuredBuffer<uint> _neighborNumPerParticle;
+RWStructuredBuffer<uint> _neighborIndexsPerParticle;
+
+struct particleData
+{
+    float3 position;
+    float3 offset;
+};
+RWStructuredBuffer<particleData> _particleDatasForRender;
+
+
+// 边界上的虚拟粒子，用于基于volume map的碰撞检测
+// 数据存储格式：xyzw中，xyz表示虚拟边界粒子在世界坐标系下的位置，w表示体积.
+// 数组开到3，是因为场景里最多就计划放3个物体.
+struct VirtualBoundaryParticle{
+    float4 vbp[3]; 
+}; 
+RWStructuredBuffer<VirtualBoundaryParticle> _virtualBoundaryParticlesData;
+
+
+
+[numthreads(32,1,1)]
+void SetParticleDatasForRender (uint3 id : SV_DispatchThreadID)
+{
+
+    float _ratio =2.0;
+    int index=id.x*4+0;
+    _particleDatasForRender[index].position = _positions[id.x];
+    _particleDatasForRender[index].offset = float3(+_ratio*_particleRadius, +_ratio*_particleRadius,0);
+
+    ++index;
+    _particleDatasForRender[index].position = _positions[id.x];
+    _particleDatasForRender[index].offset = float3(+_ratio*_particleRadius, -_ratio* _particleRadius, 0);
+
+    ++index;
+    _particleDatasForRender[index].position = _positions[id.x];
+    _particleDatasForRender[index].offset = float3(- _ratio* _particleRadius, - _ratio* _particleRadius, 0);
+
+    ++index;
+    _particleDatasForRender[index].position = _positions[id.x];
+    _particleDatasForRender[index].offset = float3(-_ratio* _particleRadius, +_ratio*_particleRadius, 0);
+        
+}
+
+
+float3 CollisionDetect(float3 _position){
+
+    float3 _pos= _position;
+
+    float random = frac(sin(_position.x+_position.y+_position.z)); 
+    random = abs(random)*0.05;
+
+
+    //x axis min
+    if(_pos.x < _boundary[0].x + _particleRadius){
+        _pos.x=_boundary[0].x + _particleRadius + random;
+    }
+    //x axis max
+    if(_pos.x > _boundary[1].x - _particleRadius){
+        _pos.x=_boundary[1].x - _particleRadius - random;
+    }
+
+    //y axis min
+    if(_pos.y < _boundary[0].y + _particleRadius){
+        _pos.y = _boundary[0].y + _particleRadius + random;
+     }
+     //y axis max
+     if(_pos.y > _boundary[1].y - _particleRadius)
+        _pos.y = _boundary[1].y - _particleRadius - random;
+    
+    //z axis min
+    if(_pos.z < _boundary[0].z + _particleRadius)
+        _pos.z = _boundary[0].z + _particleRadius + random;
+    //z axis max
+    if(_pos.z > _boundary[1].z - _particleRadius)
+        _pos.z = _boundary[1].z - _particleRadius - random;
+
+    return _pos;
+
+}
+
+[numthreads(32,1,1)]
+void EmitterGPU(uint3 id:SV_DispatchThreadID){
+    _positions[_activeParticleNums + id.x] = float3(110,55,25) + float3(0,id.x / 8,id.x % 8) ;
+    // _positions[_activeParticleNums + id.x] = float3(5,30,5 + 1.2 * id.x);
+    _velocities[_activeParticleNums + id.x] = float3(-15,0,0);
+
+}
+
+
+[numthreads(32,1,1)]
+void PreTreatment(uint3 id:SV_DispatchThreadID){
+    _oldPositions[id.x]=_positions[id.x];
+
+    float3 _velocity =_velocities[id.x];
+    float3 _position =_positions[id.x];
+
+    _velocity += G * _deltaTime; // use force to update velocity
+    _position += _velocity * _deltaTime; // use velocity to update position
+
+    _positions[id.x]=CollisionDetect(_position);
+}
+
+float Poly6(float3 _pij,float _supportRadius){
+    float _result=0.0;
+    
+    float _r = length(_pij);
+    float _h=_supportRadius;
+
+    if(_r>0 && _r<_h){
+        float _temp = (_h*_h - _r*_r)/(_h*_h*_h);
+        _result = _poly6Factor * pow(_temp,3);
+    }
+
+    return _result;
+}
+
+float3 SpikyGradient(float3 _pij,float _supportRadius){
+    float3 _result=float3(0,0,0);
+
+    float _r = length(_pij);
+    float _h = _supportRadius;
+
+    if(_r>0 && _r<_h){
+        float _temp=(_h-_r)/pow(_h,3);
+        _temp = _spikyGradFactor *pow(_temp,2);
+        _result = _temp * _pij / _r;
+    }
+
+    return _result;
+}
+
+[numthreads(32,1,1)]
+void ComputeLambdas(uint3 id:SV_DispatchThreadID){
+    //lambda = - molecule / denominator
+    float _lambda;//lambda of id.x
+    float _molecule = 0;
+    float _denominator = 0;
+    
+    //compute molecule and denominator
+    float3 _gradi=float3(0,0,0);
+
+    for(uint currentNum = 0; currentNum < _neighborNumPerParticle[id.x] ; ++currentNum){
+      uint j = _neighborIndexsPerParticle[id.x * _maxNeighborNumPerParticle + currentNum]; 
+
+        if(j==id.x)
+            continue;
+        //compute molecute
+        _molecule+= _mass * Poly6(_positions[id.x]-_positions[j],_supportRadius) / _rho0; // 具有物理含义的参数
+        
+        //compute molecule
+        float3 _gradj = _mass/_rho0 * SpikyGradient(_positions[id.x]-_positions[j],_supportRadius); // 具有物理含义的参数
+        _denominator+=dot(_gradj,_gradj);
+        _gradi+=_gradj;
+    }
+
+
+
+    //碰撞检测虚拟粒子start [刚开始,只考虑第1个模型，所以只写了vbp[0]]
+    // 开始考虑多个
+    for(int modelIndex = 0; modelIndex <3; modelIndex++){
+        _molecule += 1000.0*_virtualBoundaryParticlesData[id.x].vbp[modelIndex].w * Poly6(_positions[id.x] - _virtualBoundaryParticlesData[id.x].vbp[modelIndex].xyz,_supportRadius) / _rho0;
+
+        _gradi += 1000.0*_virtualBoundaryParticlesData[id.x].vbp[modelIndex].w / _rho0 * SpikyGradient(_positions[id.x] - _virtualBoundaryParticlesData[id.x].vbp[modelIndex].xyz,_supportRadius);
+    } 
+
+    //碰撞检测虚拟粒子end
+
+    _molecule-=1.0; // ci = (rhoi / rho0) -1
+
+    _molecule = max(_molecule,0); // 钳制一下，只在密度高的时候调用压强求解器，密度低的时候按自由落体就行了
+
+    _denominator+=dot(_gradi,_gradi);
+    _denominator+=_epsilonOfLambda;
+    //end compute molecule and denominator
+
+    _lambda=-_molecule/_denominator;
+    _lambdas[id.x] = _lambda;
+}
+
+[numthreads(32,1,1)]
+void ComputeDeltaPositions(uint3 id:SV_DispatchThreadID){
+    float3 _deltaPosition = float3(0,0,0);
+
+    for(uint currentNum = 0;currentNum<_neighborNumPerParticle[id.x];currentNum++){
+        uint j = _neighborIndexsPerParticle[id.x * _maxNeighborNumPerParticle + currentNum];
+
+        if(j==id.x)
+            continue;
+        _deltaPosition+=(_lambdas[id.x]+_lambdas[j])*SpikyGradient(_positions[id.x]-_positions[j],_supportRadius);
+
+        //_deltaPosition *= (_mass / _rho0); // 具有物理含义的参数
+    }
+
+    _deltaPosition *= (_mass/_rho0); // 应该放在这里，而不是上面
+
+     //用于碰撞检测的虚拟粒子start
+     for(int modelIndex = 0; modelIndex < 3; modelIndex++){
+        _deltaPosition += (1000.0*_virtualBoundaryParticlesData[id.x].vbp[modelIndex].w / _rho0) * (_lambdas[id.x]) * SpikyGradient(_positions[id.x] - _virtualBoundaryParticlesData[id.x].vbp[modelIndex].xyz,_supportRadius);
+     }
+
+    //虚拟粒子end    
+
+    _deltaPositions[id.x]=_deltaPosition;
+    //to Reduce the amount of calculation,"collision detection and response" is made in PostTreatment.
+}
+
+[numthreads(32,1,1)]
+void UpdatePositions(uint3 id:SV_DispatchThreadID){
+    _positions[id.x]+=_deltaPositions[id.x];
+}
+
+[numthreads(32,1,1)]
+void PostTreatment(uint3 id:SV_DispatchThreadID){
+    float3 _position = _positions[id.x];
+    _positions[id.x] = CollisionDetect(_position);
+    _velocities[id.x]=(_positions[id.x] - _oldPositions[id.x])/_deltaTime;
+    //vorticity confinement and XSPH viscosity are not major,so ignore them there.
+}
+
+
+[numthreads(32,1,1)]
+void NeighbourSearchReset(uint3 id:SV_DispatchThreadID){
+    _particleNumPerGrid[id.x] = 0;
+}
+
+int3 ComputeLogicalGridIndex(float3 _position){
+    return int3(_position.x/_gridSize , _position.y/_gridSize , _position.z/_gridSize);
+}
+
+int ComputePhysicalGridIndex(int3 _logicalGridIndex){
+    return _logicalGridIndex.x + _logicalGridIndex.y * _gridScale.x + _logicalGridIndex.z * _gridScale.y * _gridScale.x;
+}
+
+[numthreads(32,1,1)]
+void NeighbourSearchInit(uint3 id:SV_DispatchThreadID){
+    int _physicalGridIndex = ComputePhysicalGridIndex(ComputeLogicalGridIndex(_positions[id.x]));
+    int _currentNum = 0;
+
+    InterlockedAdd(_particleNumPerGrid[_physicalGridIndex],1,_currentNum);// with this atmoic operate, _currentNum is unique for each thread.
+    if(_currentNum >= _maxParticleNumPerCell){
+        return;
+    }else{
+        _particleIndexsPerGrid[_physicalGridIndex*_maxParticleNumPerCell + _currentNum] = id.x; 
+    }
+    
+}
+
+bool CrossBoundary(int3 _logicalGridIndex){
+    if(
+    _logicalGridIndex.x >=0 && _logicalGridIndex.x <= _gridScale.x -1 &&
+    _logicalGridIndex.y >=0 && _logicalGridIndex.y <= _gridScale.y -1 &&
+    _logicalGridIndex.z >=0 && _logicalGridIndex.z <= _gridScale.z -1){
+        return false;
+    }else{
+        return true;
+    }
+}
+
+
+[numthreads(32,1,1)]
+void ComputeNeighbourList(uint3 id:SV_DispatchThreadID){
+    _neighborNumPerParticle[id.x] = 0;
+    int3 _logicalGridIndex = ComputeLogicalGridIndex(_positions[id.x]);
+    //27 neighbour grids of the grid which particle[id.x] belong to
+    for(int indexX = -1;indexX<=1;indexX++){
+        for(int indexY = -1 ;indexY<=1;indexY++){
+            for(int indexZ =-1;indexZ<=1;indexZ++){
+                int3 _offset = int3 (indexX,indexY,indexZ);
+                int3 _tempLogicalGridIndex = _logicalGridIndex + _offset;
+                if(CrossBoundary(_tempLogicalGridIndex))
+                    continue;
+                int _tempPhysicalGridIndex = ComputePhysicalGridIndex(_tempLogicalGridIndex);
+                uint totalNum = min(_particleNumPerGrid[_tempPhysicalGridIndex],_maxParticleNumPerCell);
+                for(uint num = 0;num < totalNum;num++){ // check particles one by one in this grid. judge if it is the neighbour of particle[id.x]
+                    uint _index = _particleIndexsPerGrid[_tempPhysicalGridIndex * _maxParticleNumPerCell + num];//particle index to be checked.
+                    if(_index == id.x)continue;//its neighbour can not be itself.
+                    float3 r = _positions[id.x] - _positions[_index];
+                    int _currentNum = _neighborNumPerParticle[id.x];
+                    if(length(r) < 1.05*_supportRadius && _currentNum < _maxNeighborNumPerParticle){
+                        _neighborIndexsPerParticle[id.x * _maxNeighborNumPerParticle + _currentNum] = _index;
+                        _neighborNumPerParticle[id.x]++;
+                    }
+
+                }
+            }
+        }
+    }
+}
