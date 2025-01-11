@@ -1,5 +1,5 @@
 # A Robust and Efficient Model for the Interaction of Fluids with Deformable Solids
-The code in this repository provides data support for the paper "A Robust and Efficient Model for the Interaction of Fluids with Deformable Solids", which has been submitted to the journal "The Visual Computer" (under review).
+The code in this repository provides data support for the paper "A Robust and Efficient Model for the Interaction of Fluids with Deformable Solids", which has been published on the journal "The Visual Computer".
 <br>The following describes the functions of important scripts：
 <br>FluidMain script: Configure the relevant data of water simulation, call PBFSolver to implement PBF method to simulate the movement of water.
 <br>PBFSolver: Calculates the flow of water, the collision effect of water and solid. (Volume map information is needed to calculate collisions)
